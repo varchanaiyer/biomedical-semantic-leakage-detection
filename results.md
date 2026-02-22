@@ -4,54 +4,9 @@
 
 **Semantic leakage** is when an LLM's chain-of-thought (CoT) reasoning contains steps that logically contradict, reverse, or unsupported-ly depart from earlier steps — like quietly flipping a claim ("aspirin reduces MI risk" → "aspirin does not reduce MI risk") without acknowledging the shift. In a clinical or research context, such leakage undermines trust in LLM reasoning.
 
-The pipeline detects it in four stages:
+The pipeline detects it in five stages:
 
-```
-Question
-   │
-   ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 1 — CoT Generation                                   │
-│  The LLM is prompted to produce N numbered reasoning steps. │
-│  Model is called via OpenRouter (Claude, GPT-4, Gemini,     │
-│  Llama, etc.). Each step is extracted as a plain sentence.  │
-└────────────────────────┬────────────────────────────────────┘
-                         │  steps = ["Step 1 …", "Step 2 …", …]
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 2 — Concept Extraction                               │
-│  For each step, surface candidates (n-grams, acronyms) are  │
-│  generated and linked to UMLS CUIs via the NLM REST API.    │
-│  Result: a list of biomedical concepts per step.            │
-└────────────────────────┬────────────────────────────────────┘
-                         │  concepts[i] = [{cui, name, surface, score}, …]
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 3 — Hybrid NLI Entailment Checking                   │
-│  Each adjacent step pair (i → i+1) is scored for:          │
-│    • Entailment  — step j logically follows from step i     │
-│    • Neutral     — steps are unrelated or independent       │
-│    • Contradiction — step j conflicts with step i           │
-│                                                             │
-│  Primary scorer: PubMedBERT-BioNLI-LoRA (transformer NLI)  │
-│  Fallback (used here): token-overlap + negation heuristic   │
-│  UMLS adjustment: CUI Jaccard overlap boosts entailment;    │
-│  negation/direction-verb mismatch boosts contradiction.     │
-└────────────────────────┬────────────────────────────────────┘
-                         │  pairs[i] = {probs, final_label, guards}
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 4 — Guard Signal Derivation                          │
-│  Three qualitative flags are computed per pair:             │
-│    • caution_band      — top-2 NLI probs too close to call  │
-│    • lexical_duplicate — steps are near-identical (wasted)  │
-│    • direction_conflict— A→B entails but B→A contradicts    │
-│  Requires bidirectional NLI (forward + reverse scoring).    │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-                   JSON Report + Visualisations
-```
+![Chain-of-Thought Reasoning Process — pipeline flowchart](experiments/results/result_images/pipeline_flowchart.png)
 
 **NLI heuristic note.** The results below were produced with `FORCE_HEURISTIC_NLI=1` (no model download). The heuristic scores token overlap for entailment and negation/direction-verb mismatches for contradiction. It is conservative: it almost never fires entailment (consecutive CoT steps advance the argument rather than repeat words), but it reliably catches explicit polarity flips.
 
