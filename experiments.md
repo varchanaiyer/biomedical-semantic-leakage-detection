@@ -208,3 +208,107 @@ Each grid shows which pairs of questions within a concept group produced contrad
 | Only 5–6 questions per concept | Some heatmap cells represent just 1–2 step-pairs — not very reliable | Expand to 10–15 questions per concept |
 | Cross-NLI only run on primary model (claude-haiku) | Other models are cached but not yet compared cross-question | Run separately per model and compare |
 | No human labels | All contradiction calls are automated | Annotate the top contradiction examples manually to validate |
+
+---
+
+---
+
+## Experiment 3 — Guard Signal Ablation
+
+Experiments 1 and 2 used fully automated NLI scoring. This experiment uses a hand-labeled set of 101 step-pairs (39 entailment, 31 neutral, 31 contradiction) to measure how well the detector actually works — and whether the add-ons (UMLS linking and guard signals) actually help.
+
+The setup is an **ablation study**: we test four versions of the detector by turning components on and off:
+- **A: Pure NLI** — just the NLI model, nothing else
+- **B: NLI + UMLS** — NLI scores adjusted using CUI Jaccard overlap between step pairs (if two steps share the same UMLS concepts, that's evidence for entailment; if they share concepts but with conflicting relations, that's evidence for contradiction)
+- **C: NLI + Guards** — NLI scores adjusted using the guard signals (`direction_conflict`, `caution_band`, `relation_violation`, etc.)
+- **D: Full Hybrid** — all of the above combined
+
+Two new UMLS-based guard signals appear in this experiment that weren't in Exp 1:
+- `relation_violation` — fires when the UMLS ontological relation between concepts in step i conflicts with the relation implied in step i+1 (e.g., step i says drug A *treats* disease B, step i+1 implies drug A *causes* disease B)
+- `ontology_override` — fires when the model asserts something that contradicts a known UMLS hierarchy (e.g., calling a drug a disease)
+- `provisional_support` — fires when both steps reference the same concept but one step qualifies the claim with uncertainty ("may", "in some cases") while the other states it definitively
+
+We measure each condition using:
+- **AUROC** (Area Under the ROC Curve) — how well the detector ranks contradictions above non-contradictions on a scale from 0.5 (random) to 1.0 (perfect). A score of 0.96 means 96% of the time, a randomly chosen contradiction pair gets a higher score than a randomly chosen non-contradiction pair.
+- **Average Precision** — similar to AUROC but specifically measures precision at each recall threshold
+- **F1 (Contradiction)** — the harmonic mean of precision and recall specifically for the contradiction class. Precision = of pairs flagged as contradictions, how many actually were. Recall = of actual contradictions, how many did we catch.
+
+---
+
+### Figure 6 — Guard Signal Co-occurrence by Label Class
+
+![Guard Signal Co-occurrence](experiments/results/result_images/exp3_1.png)
+
+Each panel shows a 6×6 grid of guard signals. Each cell shows: given that the row signal fires on a pair, what fraction of the time does the column signal also fire? We break this down separately for entailment pairs, neutral pairs, and contradiction pairs.
+
+**What stands out:**
+
+`ontology_override` and `provisional_support` always fire together (1.00 in both directions, across all three label classes). This means they're computed from the same underlying UMLS data and essentially capture the same event — when one fires, the other always does too.
+
+`direction_conflict` is 0.00 everywhere — it never fires on any pair in this 101-pair gold set. This is a notable contrast from Exp 1, where it was the most useful discriminating signal. The difference is that the 101 gold-labeled pairs here weren't specifically selected to include direction-verb flips, so the signal has nothing to fire on.
+
+`caution_band` shows a meaningful shift across label classes. On contradiction pairs, it co-occurs with `relation_violation` (15%) and `ontology_override` (33%) — both of these are higher than in entailment pairs (where both were 0%). This tells us that when `caution_band` fires alongside a UMLS-based signal, the pair is more likely to be a contradiction than when `caution_band` fires alone.
+
+---
+
+### Figure 7 — Ablation Results: AUROC and Multi-Metric Comparison
+
+![Ablation Results](experiments/results/result_images/exp3_2.png)
+
+**(a) AUROC by condition**
+
+| Condition | AUROC | 95% CI |
+|-----------|------:|--------|
+| A: Pure NLI | 0.962 | narrow |
+| B: NLI + UMLS | 0.965 | narrow |
+| C: NLI + Guards | 0.964 | narrow |
+| D: Full Hybrid | 0.964 | narrow |
+| Random baseline | 0.500 | — |
+
+All four conditions are essentially tied. The heuristic NLI alone already achieves 0.962 AUROC — the gold-labeled pairs are clear enough that surface-level patterns (negation, token overlap) catch most of them without needing UMLS or guards. Adding UMLS gives the smallest but most consistent improvement (0.962 → 0.965). Adding guards alone doesn't improve over pure NLI. Adding everything together matches NLI + Guards, not better.
+
+**(b) Multi-metric comparison**
+
+Across AUROC, Average Precision, and F1 (Contradiction), the ordering is the same: B (NLI + UMLS) is slightly ahead, then C and D roughly equal to A. NLI + UMLS has the highest F1 at ~0.88 vs ~0.84 for the others. The differences are small in absolute terms but consistent across all three metrics, which gives some confidence that UMLS adjustment is genuinely helping rather than just noise.
+
+---
+
+### Figure 8 — Confusion Matrices for All 4 Conditions
+
+![Confusion Matrices](experiments/results/result_images/exp3_3.png)
+
+A **confusion matrix** shows the four possible outcomes for a binary classifier. Here:
+- **True Non-C, Pred Non-C** (top-left) — correctly identified as not a contradiction
+- **True Non-C, Pred Contra** (top-right) — false alarm: flagged as contradiction when it wasn't
+- **True Contra, Pred Non-C** (bottom-left) — missed contradiction
+- **True Contra, Pred Contra** (bottom-right) — correctly caught contradiction
+
+| Condition | Correct non-C | False alarms | Missed | Caught contradictions |
+|-----------|-------------:|-------------:|-------:|---------------------:|
+| A: Pure NLI | 64 | 6 | 4 | 27 |
+| B: NLI + UMLS | 65 | 5 | 3 | 28 |
+| C: NLI + Guards | 64 | 6 | 4 | 27 |
+| D: Full Hybrid | 64 | 6 | 4 | 27 |
+
+NLI + UMLS (B) is the only condition that improves on Pure NLI — it catches one additional contradiction (27→28) and generates one fewer false alarm (6→5). The margins are small, but the improvement is consistent across all three metrics in Figure 7 too.
+
+Conditions C and D produce identical results to A, which directly explains why their AUROC and F1 match. The guards contribute no additional discrimination on this specific 101-pair dataset — largely because `direction_conflict`, the most powerful guard from Exp 1, never fires on any of these pairs.
+
+---
+
+### What this tells us overall
+
+The heuristic NLI is a surprisingly strong baseline — achieving 0.962 AUROC without any ontology or rule-based augmentation. This is partly because the gold-labeled set contains clear, unambiguous contradictions that surface-level patterns catch well. In messier real-world data, the gap between Pure NLI and NLI + UMLS would likely be larger.
+
+The main practical takeaway: when UMLS is configured, use it — it gives a small consistent improvement at no extra model cost. The guard signals matter most in high-volume settings where you need to triage pairs for human review: `direction_conflict` remains the most targeted signal for contradiction (as shown in Exp 1), while `caution_band` is better used as an uncertainty flag.
+
+---
+
+### Limitations
+
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| Only 101 gold-labeled pairs | Small evaluation set — differences of 1–2 pairs drive the metric differences | Expand annotation to 500+ pairs |
+| `direction_conflict` never fires | Can't evaluate its usefulness on this set | Include pairs specifically selected for direction-verb flips |
+| All conditions very similar | Hard to tell which configuration is actually better in production | Test on noisier, less curated data where differences will be larger |
+| Heuristic NLI used | The gold labels were likely generated with this same heuristic in the loop — evaluation may be circular | Use the full PubMedBERT-BioNLI-LoRA model and compare against independent human labels |
