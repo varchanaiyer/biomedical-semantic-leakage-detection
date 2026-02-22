@@ -215,8 +215,26 @@ def _call_gemini(question: str) -> Optional[Dict[str, Any]]:
 # Public API
 # -----------------------------------------------------------------------------
 
-def generate(question: str, prefer: str = "openrouter") -> Dict[str, Any]:
+def generate(question: str, prefer: str = "openrouter", model: Optional[str] = None) -> Dict[str, Any]:
+    """Generate CoT steps for a question.
+
+    Args:
+        question: The biomedical question to reason about.
+        prefer:   Provider preference ('openrouter', 'anthropic', 'openai', 'gemini').
+        model:    Optional specific model ID to pass to the provider.
+                  When prefer='openrouter' this is an OpenRouter model slug, e.g.
+                  'anthropic/claude-haiku-4-5', 'openai/gpt-4o-mini',
+                  'google/gemini-flash-1.5', 'meta-llama/llama-3.3-70b-instruct'.
+    """
     prefer = (prefer or "").lower().strip()
+
+    # If a specific model is requested, route directly through OpenRouter
+    if model:
+        res = _call_openrouter(question, model=model)
+        if res and res.get("steps"):
+            return res
+        # fall through to normal order below
+
     order = {
         "openrouter": (_call_openrouter, _call_anthropic, lambda q: _call_openai(q, prefer_o4=False), _call_gemini),
         "anthropic":  (_call_anthropic, _call_openrouter, lambda q: _call_openai(q, prefer_o4=True), lambda q: _call_openai(q, prefer_o4=False), _call_gemini),
