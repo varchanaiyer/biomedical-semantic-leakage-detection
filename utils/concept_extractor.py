@@ -227,4 +227,16 @@ def extract_concepts(
         per_step_out.append(acc)
 
     log.info("[concepts] API-only mode: surfaces=%d, linked_surfaces=%d", len(all_surfaces), linked_count)
+
+    # 4) Validate concepts via UMLS checker (semantic types, relations, score thresholds)
+    try:
+        from utils.umls_checker import make_checker, validate_concepts as _val_concepts
+        checker = make_checker(enable_relation_check=False)
+        per_step_out = _val_concepts(per_step_out, checker=checker)
+        valid_count = sum(1 for step in per_step_out for c in step if c.get("valid"))
+        total_count = sum(len(step) for step in per_step_out)
+        log.info("[concepts] UMLS validation: %d/%d concepts valid", valid_count, total_count)
+    except Exception as e:
+        log.debug("[concepts] UMLS validation skipped: %s", e)
+
     return per_step_out

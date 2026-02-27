@@ -201,25 +201,28 @@ def _heuristic_pair(premise: str, hypothesis: str) -> Dict[str, float]:
     if not p_toks or not h_toks:
         return {"entailment": 0.33, "neutral": 0.34, "contradiction": 0.33}
 
-    inter = len(set(p_toks) & set(h_toks))
-    denom = math.sqrt(len(set(p_toks)) * len(set(h_toks))) or 1.0
-    sim = inter / denom  # 0..1
+    # Use Jaccard similarity (symmetric) to avoid inflated scores when
+    # consecutive CoT steps share vocabulary by construction.
+    p_set, h_set = set(p_toks), set(h_toks)
+    inter = len(p_set & h_set)
+    union = len(p_set | h_set) or 1
+    sim = inter / union  # 0..1
 
     p_neg = _negated(premise)
     h_neg = _negated(hypothesis)
 
     if sim > 0.65 and p_neg == h_neg:
-        e = min(0.9, 0.5 + 0.5 * sim)
-        c = 0.05
+        e = min(0.70, 0.35 + 0.4 * sim)
+        c = 0.08
         n = 1.0 - e - c
     elif sim > 0.4 and p_neg != h_neg:
-        c = min(0.85, 0.4 + 0.7 * sim)
+        c = min(0.80, 0.35 + 0.6 * sim)
         e = 0.05
         n = 1.0 - e - c
     else:
-        n = min(0.8, 0.6 + 0.4 * (1 - abs(int(p_neg) - int(h_neg))))
+        n = min(0.70, 0.50 + 0.3 * (1 - abs(int(p_neg) - int(h_neg))))
         rem = 1.0 - n
-        e = rem * 0.5 * (1 + sim)
+        e = rem * 0.4 * (1 + sim)
         c = rem - e
 
     # normalize just in case

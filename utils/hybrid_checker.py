@@ -188,8 +188,11 @@ def _heuristic_nli(premise: str, hypothesis: str) -> Dict[str, float]:
     p_toks -= _STOP
     h_toks -= _STOP
 
-    # Token overlap ratio (relative to hypothesis length, like precision)
-    overlap = len(p_toks & h_toks) / max(len(h_toks), 1) if h_toks else 0.0
+    # Token overlap ratio — use Jaccard (symmetric) rather than precision to
+    # avoid over-scoring when one step is a subset of the other.
+    inter = len(p_toks & h_toks)
+    union = len(p_toks | h_toks) or 1
+    overlap = inter / union
 
     neg_p = _neg_present(premise)
     neg_h = _neg_present(hypothesis)
@@ -199,18 +202,21 @@ def _heuristic_nli(premise: str, hypothesis: str) -> Dict[str, float]:
     ant_h = _ant_present(hypothesis)
 
     # --- contradiction signals ---
-    contra = 0.05  # small base
+    contra = 0.08  # modest base — some step pairs DO contradict
     if neg_p ^ neg_h:                        # one negated, the other not
         contra += 0.35
     if (pos_p and ant_h) or (ant_p and pos_h):  # opposite effect verbs
         contra += 0.25
 
     # --- entailment signals ---
-    # High overlap → consecutive step likely extends the same idea
-    entail = min(0.65, overlap * 0.85)
+    # Cap entailment lower — consecutive steps share vocabulary by design,
+    # so overlap alone is weak evidence of logical entailment.
+    entail = min(0.50, overlap * 0.60)
 
-    # Fallback: if no strong signal, lean neutral
-    neutral = max(0.05, 1.0 - entail - contra)
+    # --- neutral as default ---
+    # Lean more neutral: without strong directional signals, steps are
+    # often merely topically related, not logically entailing.
+    neutral = max(0.15, 1.0 - entail - contra)
 
     return _renorm({"entailment": entail, "neutral": neutral, "contradiction": contra})
 
@@ -273,40 +279,66 @@ def _adjust_with_umls(
     step_j: str,
     umls_i: List[Dict[str, Any]],
     umls_j: List[Dict[str, Any]],
+    relation_info: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, float]:
     """
-    Heuristic adjustments based on UMLS overlap and negation/antonym cues.
+    Adjustments based on UMLS overlap, semantic type relations, and negation cues.
+
+    Design: adjustments are balanced so the base NLI model's decision is nudged,
+    not overridden. CUI overlap boosts are intentionally small because consecutive
+    CoT steps naturally share medical concepts.
     """
     probs = dict(base_probs)
 
-    # CUI overlap → boost entailment
+    # 1) CUI overlap — light adjustments only
     cuis_i = _collect_cuis(umls_i)
     cuis_j = _collect_cuis(umls_j)
     jac = _jaccard(cuis_i, cuis_j)
     if jac >= 0.5:
-        probs["entailment"] += 0.18
-        probs["neutral"] -= 0.08
+        probs["entailment"] += 0.03
+        probs["neutral"] -= 0.02
     elif jac >= 0.25:
-        probs["entailment"] += 0.10
-        probs["neutral"] -= 0.05
+        probs["entailment"] += 0.02
+        probs["neutral"] -= 0.01
     elif (cuis_i and cuis_j) and jac == 0.0:
-        # different concepts → small pull toward neutral
-        probs["neutral"] += 0.05
+        # Disjoint concept sets suggest a topic shift
+        probs["neutral"] += 0.04
+        probs["contradiction"] += 0.03
 
-    # Negation/antonym mismatches → boost contradiction
+    # 2) Relation-aware adjustments (from umls_checker)
+    if relation_info:
+        has_any_allowed = any(r.get("allowed") for r in relation_info)
+        has_any_violation = any(not r.get("allowed") for r in relation_info)
+
+        if has_any_allowed and not has_any_violation:
+            probs["entailment"] += 0.04
+        elif has_any_violation and not has_any_allowed:
+            probs["contradiction"] += 0.06
+            probs["entailment"] -= 0.03
+
+    # 3) Negation/antonym mismatches → boost contradiction
     neg_i, neg_j = _neg_present(step_i), _neg_present(step_j)
     pos_i, pos_j = _pos_present(step_i), _pos_present(step_j)
     ant_i, ant_j = _ant_present(step_i), _ant_present(step_j)
 
-    if neg_i ^ neg_j:
-        probs["contradiction"] += 0.18
-        probs["entailment"] -= 0.08
+    has_negation_mismatch = neg_i ^ neg_j
+    has_direction_mismatch = (pos_i and ant_j) or (ant_i and pos_j)
 
-    # opposite effect verbs (increase vs decrease)
-    if (pos_i and ant_j) or (ant_i and pos_j):
-        probs["contradiction"] += 0.12
+    if has_negation_mismatch or has_direction_mismatch:
+        e = probs.get("entailment", 0.0)
+        c = probs.get("contradiction", 0.0)
+        gap = max(0.0, e - c)
 
-    # Light regularization: keep probabilities sane
+        if has_negation_mismatch and has_direction_mismatch:
+            boost = max(0.25, gap * 0.55)
+        elif has_negation_mismatch:
+            boost = max(0.18, gap * 0.45)
+        else:
+            boost = max(0.12, gap * 0.35)
+
+        probs["contradiction"] += boost
+        probs["entailment"] -= boost * 0.7
+
     probs = _renorm(probs)
     return probs
 
@@ -350,16 +382,40 @@ def build_entailment_records(
 
     base_scores = _nli_scores_batch(texts, max_length=max_length, batch_size=batch_size)
 
+    # Compute UMLS relation diagnostics for all adjacent pairs
+    _rel_by_pair: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    has_real_concepts = any(any(c.get("cui") for c in step_umls) for step_umls in umls_per_step)
+    if use_umls and has_real_concepts:
+        try:
+            from utils.umls_checker import make_checker, validate_relations
+            checker = make_checker(enable_relation_check=True)
+            rel_diags = validate_relations(umls_per_step, checker=checker)
+            for rd in rel_diags:
+                key = (rd["i"], rd["j"])
+                _rel_by_pair.setdefault(key, []).append(rd)
+        except Exception as e:
+            log.debug("[hybrid] relation validation skipped: %s", e)
+
     out: List[Dict[str, Any]] = []
     for (i, j), base in zip(pairs, base_scores):
         probs = dict(base)
+        pair_rels = _rel_by_pair.get((i, j), [])
+        umls_i = umls_per_step[i] or []
+        umls_j = umls_per_step[j] or []
+
         if use_umls:
             probs = _adjust_with_umls(
-                probs, steps[i], steps[j], umls_per_step[i] or [], umls_per_step[j] or []
+                probs, steps[i], steps[j], umls_i, umls_j,
+                relation_info=pair_rels,
             )
         # final label
         label = max(probs.items(), key=lambda kv: kv[1])[0]
-        # normalize naming to what main.py expects
+
+        # Compute relation flags for downstream guard signals
+        has_relation_violation = bool(pair_rels and not any(r.get("allowed") for r in pair_rels))
+        has_ontology_support = bool(pair_rels and any(r.get("allowed") for r in pair_rels))
+        umls_jac = _jaccard(_collect_cuis(umls_i), _collect_cuis(umls_j))
+
         rec = {
             "step_pair": [i, j],
             "probs": {
@@ -371,7 +427,12 @@ def build_entailment_records(
             "meta": {
                 "model": _MODEL_NAME or "heuristic" if not _TRANSFORMERS_OK else (_MODEL_NAME or "unknown"),
                 "device": _pick_device() if not _TRANSFORMERS_OK else _DEV,
-                "umls_overlap_jaccard": _jaccard(_collect_cuis(umls_per_step[i] or []), _collect_cuis(umls_per_step[j] or [])),
+                "umls_overlap_jaccard": umls_jac,
+                "relation_violation": has_relation_violation,
+                "ontology_support": has_ontology_support,
+                "relation_details": pair_rels[:3] if pair_rels else [],
+                "concepts_i_count": len([c for c in umls_i if c.get("valid")]),
+                "concepts_j_count": len([c for c in umls_j if c.get("valid")]),
             },
         }
         out.append(rec)

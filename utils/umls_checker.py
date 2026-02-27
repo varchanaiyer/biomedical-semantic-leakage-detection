@@ -1,26 +1,129 @@
 # utils/umls_checker.py — Validate concepts and relations using UMLS ontologies
 from __future__ import annotations
-from typing import List, Dict, Any, Iterable, Optional, Sequence
+from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 from dataclasses import dataclass
 
-# Define type buckets for coarse relation compatibility (TUI buckets)
-TUI_BUCKETS = {
-    # Example mapping of Semantic Type TUIs to broad categories (for demonstration)
-    "T047": "Disease",   # e.g., Disease or Syndrome
-    "T121": "Pharmaco",  # e.g., Pharmacologic Substance
-    "T129": "Pharmaco",  # e.g., Immunologic Factor (also treat as Pharmaco)
-    "T195": "Pharmaco",  # e.g., Antibiotic
+# Map UMLS semantic type *names* (as returned by the REST API) to broad buckets.
+# The UMLS API returns semantic types as human-readable names like "Disease or Syndrome",
+# NOT as TUI codes like "T047".  We also keep TUI codes for backward compatibility.
+SEMTYPE_BUCKETS: Dict[str, str] = {
+    # Disease / Condition
+    "Disease or Syndrome": "Disease",
+    "Neoplastic Process": "Disease",
+    "Pathologic Function": "Disease",
+    "Sign or Symptom": "Disease",
+    "Congenital Abnormality": "Disease",
+    "Acquired Abnormality": "Disease",
+    "Injury or Poisoning": "Disease",
+    "Mental or Behavioral Dysfunction": "Disease",
+    "Cell or Molecular Dysfunction": "Disease",
+    # Pharmacological
+    "Pharmacologic Substance": "Pharmaco",
+    "Antibiotic": "Pharmaco",
+    "Immunologic Factor": "Pharmaco",
+    "Biomedical or Dental Material": "Pharmaco",
+    "Hormone": "Pharmaco",
+    "Enzyme": "Pharmaco",
+    "Vitamin": "Pharmaco",
+    "Amino Acid, Peptide, or Protein": "Pharmaco",
+    "Biologically Active Substance": "Pharmaco",
+    "Organic Chemical": "Pharmaco",
+    # Clinical Drug
+    "Clinical Drug": "ClinicalDrug",
+    # Anatomy
+    "Body Part, Organ, or Organ Component": "Anatomy",
+    "Tissue": "Anatomy",
+    "Cell": "Anatomy",
+    "Cell Component": "Anatomy",
+    "Body System": "Anatomy",
+    "Body Space or Junction": "Anatomy",
+    # Physiology / Function
+    "Organ or Tissue Function": "Physiology",
+    "Physiologic Function": "Physiology",
+    "Molecular Function": "Physiology",
+    "Cell Function": "Physiology",
+    "Genetic Function": "Physiology",
+    "Mental Process": "Physiology",
+    # Diagnostic / Lab
+    "Laboratory Procedure": "Diagnostic",
+    "Diagnostic Procedure": "Diagnostic",
+    "Laboratory or Test Result": "Diagnostic",
+    "Therapeutic or Preventive Procedure": "Procedure",
+    # Backward-compat TUI codes
+    "T047": "Disease",
+    "T191": "Disease",
+    "T046": "Disease",
+    "T184": "Disease",
+    "T019": "Disease",
+    "T020": "Disease",
+    "T037": "Disease",
+    "T048": "Disease",
+    "T049": "Disease",
+    "T121": "Pharmaco",
+    "T129": "Pharmaco",
+    "T195": "Pharmaco",
+    "T125": "Pharmaco",
+    "T126": "Pharmaco",
+    "T116": "Pharmaco",
+    "T127": "Pharmaco",
+    "T123": "Pharmaco",
     "T200": "ClinicalDrug",
-    # ... (other mappings as needed)
+    "T023": "Anatomy",
+    "T024": "Anatomy",
+    "T025": "Anatomy",
+    "T026": "Anatomy",
+    "T022": "Anatomy",
+    "T030": "Anatomy",
+    "T042": "Physiology",
+    "T039": "Physiology",
+    "T044": "Physiology",
+    "T043": "Physiology",
+    "T045": "Physiology",
+    "T041": "Physiology",
+    "T059": "Diagnostic",
+    "T060": "Diagnostic",
+    "T034": "Diagnostic",
+    "T061": "Procedure",
 }
-# Pairs of allowed relations between categories
-ALLOWED_RELATIONS = {
+
+# Keep old name for backward compat
+TUI_BUCKETS = SEMTYPE_BUCKETS
+
+# Allowed relation pairs between type buckets
+ALLOWED_RELATIONS: Dict[Tuple[str, str], str] = {
     ("Pharmaco", "Disease"): "treats",
     ("ClinicalDrug", "Disease"): "treats",
     ("Pharmaco", "Pharmaco"): "interacts",
-    # ... (other allowed type relations)
+    ("Pharmaco", "Physiology"): "modulates",
+    ("Pharmaco", "Anatomy"): "targets",
+    ("Disease", "Anatomy"): "affects",
+    ("Disease", "Physiology"): "disrupts",
+    ("Diagnostic", "Disease"): "diagnoses",
+    ("Procedure", "Disease"): "treats",
+    ("Procedure", "Anatomy"): "targets",
 }
-SYMMETRIC_KEYS = {("Pharmaco", "Pharmaco")}  # treat this pair as symmetric relation
+SYMMETRIC_KEYS = {
+    ("Pharmaco", "Pharmaco"),
+    ("Disease", "Anatomy"),
+    ("Pharmaco", "Disease"),
+    ("Pharmaco", "Physiology"),
+}
+
+
+def _parse_semtype(st: Any) -> str:
+    """Extract a semantic type string from either a dict or a plain string."""
+    if isinstance(st, dict):
+        return st.get("name") or st.get("value") or ""
+    return str(st) if st else ""
+
+
+def _best_bucket_from_stypes(semantic_types: List[str]) -> Optional[str]:
+    """Find the best matching bucket for a list of semantic type strings."""
+    for st in semantic_types:
+        if st in SEMTYPE_BUCKETS:
+            return SEMTYPE_BUCKETS[st]
+    return None
+
 
 @dataclass
 class CheckerConfig:
@@ -28,12 +131,12 @@ class CheckerConfig:
     main_sources: Iterable[str] = ()
     secondary_sources: Iterable[str] = ()
     allowed_tuis: Iterable[str] = ()
-    min_score: float = 0.0
+    min_score: float = 0.30
     enable_relation_check: bool = False
     require_main_source: bool = False
     ban_generic: bool = False
     upgrade_bioprocess_terms: bool = False
-    allow_missing_score: bool = True
+    allow_missing_score: bool = False
 
 class ConceptRecord:
     """Internal wrapper for a concept dict for easier validation."""
@@ -41,10 +144,11 @@ class ConceptRecord:
         self.text = cdict.get("text", "")
         self.cui = cdict.get("cui", "").strip()
         self.canonical = cdict.get("canonical", "")
-        self.semantic_types = [d.get("name") for d in (cdict.get("semantic_types") or [])]
+        # Handle both dict and string formats for semantic_types
+        raw_stypes = cdict.get("semantic_types") or []
+        self.semantic_types: List[str] = [_parse_semtype(st) for st in raw_stypes]
         self.kb_sources = [s for s in (cdict.get("kb_sources") or [])]
-        self.score = None
-        # If scores present, consider 'confidence' or 'api' as primary
+        self.score: Optional[float] = None
         scores = cdict.get("scores") or {}
         if "confidence" in scores:
             self.score = float(scores["confidence"])
@@ -52,6 +156,7 @@ class ConceptRecord:
             self.score = float(scores["api"])
         self.valid = False
         self.reasons: List[str] = []
+
 
 class UMLSChecker:
     def __init__(self, config: CheckerConfig = CheckerConfig()):
@@ -69,8 +174,8 @@ class UMLSChecker:
         # Semantic type filter
         allowed_tui = True
         if self.cfg.allowed_tuis:
-            tuis = [t for t in c.semantic_types if t in TUI_BUCKETS]  # treat semantic_types as TUI codes if matching
-            if not tuis or not any(t in self.cfg.allowed_tuis for t in tuis):
+            matched = [t for t in c.semantic_types if t in SEMTYPE_BUCKETS or t in self.cfg.allowed_tuis]
+            if not matched:
                 allowed_tui = False
                 reasons.append("semantic type not allowed")
         # Main source requirement
@@ -78,22 +183,27 @@ class UMLSChecker:
             main_ok = any(src.upper() in (s.upper() for s in self.cfg.main_sources) for src in c.kb_sources)
             if not main_ok:
                 reasons.append("missing main source")
-        # Generic term ban (optional simplistic check via text length or certain words)
+        # Generic term ban
         if self.cfg.ban_generic and len(c.text.split()) <= 1:
             reasons.append("generic/uninformative span")
-
-        # Bioprocess upgrade (not elaborated here)
+        # Bioprocess upgrade
         if self.cfg.upgrade_bioprocess_terms and "generic/uninformative span" in reasons:
-            # If a term is a known bioprocess, remove that reason (example logic)
             reasons = [r for r in reasons if r != "generic/uninformative span"]
-
         # Score threshold check
         score_ok = (c.score is None and self.cfg.allow_missing_score) or (c.score is not None and c.score >= self.cfg.min_score)
 
-        c.valid = bool(score_ok and src_ok and allowed_tui and c.cui)
+        # Require a recognized biomedical semantic type for validity
+        bucket = _best_bucket_from_stypes(c.semantic_types)
+        has_biomedical_type = bucket is not None
+        if not has_biomedical_type and c.semantic_types:
+            reasons.append("no recognized biomedical semantic type")
+
+        c.valid = bool(score_ok and src_ok and allowed_tui and c.cui and has_biomedical_type)
         cdict_out = {**cdict}
         cdict_out["valid"] = c.valid
-        cdict_out["reasons"] = sorted(set(reasons)) if not c.valid else [f"ok{''}"]
+        cdict_out["reasons"] = sorted(set(reasons)) if not c.valid else ["ok"]
+        # Add bucket info for downstream use
+        cdict_out["bucket"] = bucket
         return cdict_out
 
     def validate_step_concepts(self, step_concepts: Iterable[Iterable[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
@@ -104,13 +214,12 @@ class UMLSChecker:
         return out
 
     def _best_bucket(self, concept: Dict[str, Any]) -> Optional[str]:
-        # Determine broad bucket for a concept's semantic types
+        # Check pre-computed bucket first
+        if concept.get("bucket"):
+            return concept["bucket"]
         stypes = concept.get("semantic_types") or []
-        tuis = [obj["name"] for obj in stypes if obj.get("name")]
-        for t in tuis:
-            if t in TUI_BUCKETS:
-                return TUI_BUCKETS[t]
-        return None
+        parsed = [_parse_semtype(st) for st in stypes]
+        return _best_bucket_from_stypes(parsed)
 
     def _pair_allowed(self, a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         ba = self._best_bucket(a)
@@ -120,9 +229,13 @@ class UMLSChecker:
         verb = ALLOWED_RELATIONS.get((ba, bb))
         if verb:
             return True, verb
-        # symmetric support for selected pairs
+        # symmetric support
         if (bb, ba) in ALLOWED_RELATIONS and (ba, bb) in SYMMETRIC_KEYS:
             return True, ALLOWED_RELATIONS[(bb, ba)]
+        # try reverse
+        verb_rev = ALLOWED_RELATIONS.get((bb, ba))
+        if verb_rev and (bb, ba) in SYMMETRIC_KEYS:
+            return True, verb_rev
         return False, None
 
     def validate_relations_adjacent(self, step_concepts: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -140,7 +253,13 @@ class UMLSChecker:
                         continue
                     ok, verb = self._pair_allowed(ca, cb)
                     diagnostics.append({
-                        "i": s, "j": s + 1, "a": ca, "b": cb,
+                        "i": s, "j": s + 1,
+                        "a_cui": ca.get("cui", ""),
+                        "a_name": ca.get("canonical", ca.get("text", "")),
+                        "a_bucket": self._best_bucket(ca),
+                        "b_cui": cb.get("cui", ""),
+                        "b_name": cb.get("canonical", cb.get("text", "")),
+                        "b_bucket": self._best_bucket(cb),
                         "allowed": bool(ok),
                         "verb": (verb if ok else None),
                         "reason": (f"type-compatible: {verb}" if ok else "no supported relation between types"),
@@ -155,7 +274,6 @@ def validate_concepts(per_step_concepts: Sequence[Sequence[Dict[str, Any]]],
     ch = checker or _DEFAULT_CHECKER
     return ch.validate_step_concepts(per_step_concepts)
 
-# Back-compat alias
 def validate_step_concepts(per_step_concepts: Sequence[Sequence[Dict[str, Any]]],
                            checker: Optional[UMLSChecker] = None) -> List[List[Dict[str, Any]]]:
     return validate_concepts(per_step_concepts, checker)
@@ -197,24 +315,12 @@ def make_checker(
         cfg.upgrade_bioprocess_terms = bool(upgrade_bioprocess_terms)
     return UMLSChecker(cfg)
 
-# Relation helper shims (compatibility with older code)
 def _best_bucket_for_concept(concept: Dict[str, Any]) -> Optional[str]:
     stypes = concept.get("semantic_types") or []
-    tuis: List[str] = []
-    for st in stypes:
-        if isinstance(st, dict):
-            t = st.get("name")
-        else:
-            t = str(st)
-        if t and t in TUI_BUCKETS:
-            return TUI_BUCKETS[t]
-    return None
+    parsed = [_parse_semtype(st) for st in stypes]
+    return _best_bucket_from_stypes(parsed)
 
 def has_supported_relation(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    """
-    Back-compat helper used in older code.
-    Returns True if the coarse type buckets of (a -> b) are supported.
-    """
     ba = _best_bucket_for_concept(a)
     bb = _best_bucket_for_concept(b)
     if not ba or not bb:
@@ -223,12 +329,9 @@ def has_supported_relation(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         return True
     if (bb, ba) in ALLOWED_RELATIONS and (ba, bb) in SYMMETRIC_KEYS:
         return True
+    if (bb, ba) in ALLOWED_RELATIONS and (bb, ba) in SYMMETRIC_KEYS:
+        return True
     return False
 
-# (Optional) provisional_support placeholder for older code:
 def provisional_support(concept_a: Dict[str, Any], concept_b: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Back-compat stub for older provisional support check.
-    This could implement a check if concept_a and concept_b appear together in known knowledge (not implemented here).
-    """
     return {"allowed": False, "evidence": []}
