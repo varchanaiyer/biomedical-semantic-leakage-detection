@@ -131,7 +131,7 @@ class CheckerConfig:
     main_sources: Iterable[str] = ()
     secondary_sources: Iterable[str] = ()
     allowed_tuis: Iterable[str] = ()
-    min_score: float = 0.30
+    min_score: float = 0.50
     enable_relation_check: bool = False
     require_main_source: bool = False
     ban_generic: bool = False
@@ -192,13 +192,16 @@ class UMLSChecker:
         # Score threshold check
         score_ok = (c.score is None and self.cfg.allow_missing_score) or (c.score is not None and c.score >= self.cfg.min_score)
 
-        # Require a recognized biomedical semantic type for validity
+        # Check for recognized biomedical semantic type (if types are available)
         bucket = _best_bucket_from_stypes(c.semantic_types)
         has_biomedical_type = bucket is not None
+        # The UMLS /search endpoint does NOT return semantic types — only /content/CUI does.
+        # So semantic_types is usually empty.  Don't penalise when types are simply absent.
         if not has_biomedical_type and c.semantic_types:
             reasons.append("no recognized biomedical semantic type")
+        types_ok = has_biomedical_type or (not c.semantic_types)  # empty types = OK
 
-        c.valid = bool(score_ok and src_ok and allowed_tui and c.cui and has_biomedical_type)
+        c.valid = bool(score_ok and src_ok and allowed_tui and c.cui and types_ok)
         cdict_out = {**cdict}
         cdict_out["valid"] = c.valid
         cdict_out["reasons"] = sorted(set(reasons)) if not c.valid else ["ok"]
