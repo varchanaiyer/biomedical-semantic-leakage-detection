@@ -79,9 +79,9 @@ DEFAULT_TTYS = os.getenv("UMLS_DEFAULT_TTYS", "")  # e.g. "PT,SY,IN"
 NOISE_MAX_TOKENS = int(os.getenv("UMLS_NOISE_MAX_TOKENS", "8"))
 NOISE_MIN_ALPHA = int(os.getenv("UMLS_NOISE_MIN_ALPHA", "3"))
 
-# Coverage tuning
-MAX_VARIANTS_PER_SURFACE = 8
-MAX_NGRAMS_PER_SURFACE   = 12
+# Coverage tuning (reduced for speed; original: 8/12)
+MAX_VARIANTS_PER_SURFACE = 4
+MAX_NGRAMS_PER_SURFACE   = 6
 MIN_NGRAM_LEN            = 2
 MAX_NGRAM_LEN            = 4
 
@@ -487,7 +487,7 @@ def _umls_search_multi(
     if _looks_like_noise(term):
         return []
     all_rows: Dict[str, Dict[str, Any]] = {}
-    for mode in ("", "words", "approximate"):
+    for mode in ("", "words"):  # skip "approximate" for speed
         try:
             cuis, api_scores, canonicals, semtypes_list, sources_list = _cached_search(
                 apikey, term, page_size, sabs, ttys, mode

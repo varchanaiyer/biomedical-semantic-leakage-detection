@@ -13,7 +13,7 @@ log = logging.getLogger("concepts")
 
 # --- knobs (env-overridable) -------------------------------------------------
 
-MAX_SURFACES_PER_STEP = int(os.getenv("CE_MAX_SURFACES_PER_STEP", "25"))
+MAX_SURFACES_PER_STEP = int(os.getenv("CE_MAX_SURFACES_PER_STEP", "12"))
 MAX_CANDIDATES_PER_STEP = int(os.getenv("CE_MAX_CANDIDATES_PER_STEP", "32"))
 NGRAM_MIN = 2
 NGRAM_MAX = 5
